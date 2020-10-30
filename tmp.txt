@@ -1,0 +1,181 @@
+	static uint32_t Count_RisingEdge;
+	static uint32_t Count_FallingEdge;
+	static uint32_t Count_Freq1;
+	static uint32_t Count_Freq2;
+	static bool Freq_State;
+
+	if(htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3){
+		Count_RisingEdge = TIM2->CCR3;
+
+		if(Freq_State == 0){
+			Freq_State = 1;
+			Count_Freq1 = Count_RisingEdge;
+
+		}
+		else if(Freq_State == 1){
+			Freq_State = 0;
+			Count_Freq2 = Count_RisingEdge;
+			if(Count_Freq2 > Count_Freq1) inputFrequency = 1/((float)Count_Freq2 - (float)Count_Freq1) * 1000000; //in kHz;
+		}
+	}
+
+	else if(htim->Channel == HAL_TIM_ACTIVE_CHANNEL_4){
+		Count_FallingEdge = TIM2->CCR4;
+
+		if(Count_RisingEdge < Count_FallingEdge){
+			inputDutyCycle = Count_FallingEdge - Count_RisingEdge;
+			input_pwm_min = inputDutyCycle < input_pwm_min ? inputDutyCycle : input_pwm_min;
+			input_pwm_max = inputDutyCycle > input_pwm_max ? inputDutyCycle : input_pwm_max;
+
+			newPWM = map(inputDutyCycle, input_pwm_min, input_pwm_max, PWM_MIN, PWM_MAX);
+			setPWM = newPWM;
+
+			Count_RisingEdge = 0;
+			Count_FallingEdge = 0;
+		}
+	}
+
+	if(inputFrequency >= FREQ_INPUT_PWM_MIN && inputFrequency <= FREQ_INPUT_PWM_MAX){
+		//strSize = sprintf((char*)buffer, "Frequency %f\t PWM: %d\r\n", inputFrequency, setPWM);
+		//HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+		if(setPWM >= 300 && motorGotStarted == 0){
+			//motorGotStarted = 1;
+			HAL_TIM_IC_Stop_IT(&htim2, TIM_CHANNEL_3);
+			HAL_TIM_IC_Stop_IT(&htim2, TIM_CHANNEL_4);
+			motorGotStarted = 1;
+			strSize = sprintf((char*)buffer, "Motor Started\r\n");
+			HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+		}
+
+		if(setPWM <= 50 && motorGotStarted != 0) {
+			TIM1->CCR1 = 0;
+			TIM1->CCR5 = 0;
+		}
+
+		if(motorGotStarted == 2){
+			TIM1->CCR1 = setPWM;
+			TIM1->CCR5 = setPWM + compWindowOffset;
+		}
+	}
+	
+void startMotor(){
+	mode_motor = MODE_MOTOR_START;
+	newPWM = setPWM = 600;
+	uint32_t phaseACNT = 0;
+	uint32_t phaseBCNT = 0;
+	uint32_t phaseCCNT = 0;
+
+	TIM1->CCR1 = setPWM;
+	TIM1->CCR5 = setPWM + compWindowOffset;
+	HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 100);
+
+	HAL_COMP_Start(&hcomp2);
+
+	HAL_GPIO_WritePin(INH_B_GPIO_Port, INH_B_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(INH_C_GPIO_Port, INH_C_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(IN_A_GPIO_Port, IN_A_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(INH_A_GPIO_Port, INH_A_Pin, GPIO_PIN_SET);
+
+	__HAL_TIM_SET_COUNTER(&htim2, 0);
+	HAL_UART_Transmit(&huart1, "1\r\n",3,10);
+	while(HAL_COMP_GetOutputLevel(&hcomp2) == 0U);
+	HAL_UART_Transmit(&huart1, "1\r\n",3,10);
+	phaseACNT = __HAL_TIM_GET_COUNTER(&htim2);
+	HAL_COMP_Stop(&hcomp2);
+
+	HAL_COMP_Start(&hcomp3);
+
+	HAL_GPIO_WritePin(INH_C_GPIO_Port, INH_C_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(INH_A_GPIO_Port, INH_A_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(IN_B_GPIO_Port, IN_B_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(INH_B_GPIO_Port, INH_B_Pin, GPIO_PIN_SET);
+
+	__HAL_TIM_SET_COUNTER(&htim2, 0);
+	while(HAL_COMP_GetOutputLevel(&hcomp3) == 0U);
+	phaseBCNT = __HAL_TIM_GET_COUNTER(&htim2);
+	HAL_COMP_Stop(&hcomp3);
+
+	HAL_COMP_Start(&hcomp1);
+
+	HAL_GPIO_WritePin(INH_A_GPIO_Port, INH_A_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(INH_B_GPIO_Port, INH_B_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(IN_C_GPIO_Port, IN_C_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(INH_C_GPIO_Port, INH_C_Pin, GPIO_PIN_SET);
+
+	__HAL_TIM_SET_COUNTER(&htim2, 0);
+	while(HAL_COMP_GetOutputLevel(&hcomp1) == 0U);
+	phaseCCNT = __HAL_TIM_GET_COUNTER(&htim2);
+	HAL_COMP_Stop(&hcomp1);
+
+	HAL_GPIO_WritePin(INH_A_GPIO_Port, INH_A_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(INH_B_GPIO_Port, INH_B_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(INH_C_GPIO_Port, INH_C_Pin, GPIO_PIN_RESET);
+	strSize = sprintf((char*)buffer, "PHASE A CNT: %lu\tPHASE B CNT: %lu\tPHASE C CNT: %lu\r\n", phaseACNT, phaseBCNT, phaseCCNT);
+	HAL_UART_Transmit(&huart1, buffer, strSize, 100);
+	while(1);
+
+}
+
+	static uint32_t Count_RisingEdge;
+	static uint32_t Count_FallingEdge;
+
+	if(htim->Instance == TIM15){
+		if(htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1){
+			Count_RisingEdge = TIM15->CCR1;
+		} else if(htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2){
+			Count_FallingEdge = TIM15->CCR2;
+		}
+
+		inputFrequency = (1 /(float)Count_RisingEdge) * 1000000; //Convert to Hz
+
+		inputDutyCycle = Count_FallingEdge;
+
+		//input_pwm_min = inputDutyCycle < input_pwm_min ? inputDutyCycle : input_pwm_min;
+		//input_pwm_max = inputDutyCycle > input_pwm_max ? inputDutyCycle : input_pwm_max;
+
+		if(inputFrequency >= FREQ_INPUT_PWM_MIN && inputFrequency <= FREQ_INPUT_PWM_MAX){
+			newPWM = map(inputDutyCycle, input_pwm_min, input_pwm_max, PWM_MIN, PWM_MAX);
+			setPWM = newPWM;
+			if(setPWM >= 300 && motorGotStarted == 0){
+				motorGotStarted = 1;
+				strSize = sprintf((char*)buffer, "Motor Started\r\n");
+				HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+			}
+
+			if(motorGotStarted == 2 && setPWM > 100){
+				TIM1->CCR1 = setPWM;
+				TIM1->CCR5 = setPWM + compWindowOffset;
+			}
+		}
+	}
+	
+	
+	/*if(__HAL_TIM_GET_FLAG(&htim1, TIM_FLAG_CC2) == SET){
+		if(PWMHigh){
+			HAL_ADC_Stop(&hadc2);
+			__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+
+			PWMHigh = false;
+		} else if(!PWMHigh){
+			HAL_ADC_Start(&hadc2);
+
+			//static uint8_t counter;
+			while(TIM1->CNT < TIM1->CCR1){
+				if(__HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_EOC) == SET){
+					adcIntegral += HAL_ADC_GetValue(&hadc2);
+					//counter += 1;
+				}
+			}
+
+			//counter = 0;
+			__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, setPWM);
+
+			PWMHigh = true;
+		}
+	}
+	if(adcIntegral >= adcOffset) {
+		adcIntegral = 0;
+		__HAL_TIM_DISABLE_IT(&htim1, TIM_IT_CC2);
+		HAL_ADC_Stop(&hadc2);
+		commutationPattern(NEXT);
+	}*/
