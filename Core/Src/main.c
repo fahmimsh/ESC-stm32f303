@@ -33,6 +33,8 @@
 /* USER CODE BEGIN PTD */
 typedef enum{
 	MODE_MOTOR_STOP,
+	MODE_MOTOR_CALIBRATION,
+	MODE_MOTOR_READY,
 	MODE_MOTOR_START,
 	MODE_MOTOR_RUN
 } MODE_MOTOR_t;
@@ -51,6 +53,8 @@ typedef enum{
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
+DMA_HandleTypeDef hdma_adc1;
+DMA_HandleTypeDef hdma_adc2;
 
 COMP_HandleTypeDef hcomp1;
 COMP_HandleTypeDef hcomp2;
@@ -62,7 +66,9 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim15;
+TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
@@ -79,30 +85,39 @@ volatile uint16_t commutationTimerCounterAverage;
 volatile uint16_t counterTIM3Values;
 volatile int16_t commutationTimerOffset;
 
-volatile uint32_t tim2cnt;
+uint32_t tim2cnt;
 uint8_t RXBuffer[200];
 bool USART1DataFlag = false;
+float adcIntegral = 0;
 
 volatile int16_t newPWM = 100;
 volatile int16_t setPWM = 100;
-volatile int16_t compWindowOffset = 300; //this opens a comparator window to block overshooting signals from triggering (adjust to Vbat)
-volatile uint16_t oc5Value = 128;  //preset offset-value (for fine tuning) of the DAC voltage output as the reference voltage for the compartors (about 0V or Vbat/2)
+volatile int16_t compWindowOffset = 250; //this opens a comparator window to block overshooting signals from triggering (adjust to Vbat)
+volatile uint16_t oc5Value = 200;  //preset offset-value (for fine tuning) of the DAC voltage output as the reference voltage for the compartors (about 0V or Vbat/2)
 volatile uint8_t pwmState = 0; //indicates whether a zero crossing (pwm low) or a Vbat/2 crossing (pwm high) will be detected; 0 = PWM low detection, 1 = PWM high detection
 volatile uint8_t bTransferRequest = 0;
 volatile uint8_t motorGotStarted = 0;
 
-volatile ADC_ChannelConfTypeDef sConfig;
-volatile uint32_t adcOffset;
-volatile uint32_t adcIntegral;
-volatile uint8_t adcCounter = 0;
+ADC_ChannelConfTypeDef sConfig;
+TIM_OC_InitTypeDef sConfigOC5B;
+TIM_OC_InitTypeDef sConfigOC5A;
+//float adcOffset = 2500;
+float adcOffset = 2000;
+uint8_t adcCounter = 0;
+uint16_t csADC[12];
+uint16_t adcBuffer[10];
+uint16_t csSize;
+uint8_t csString[100];
+uint32_t tim7cnt;
 
 volatile bool readRotation = false;
 
-float rpm = 0;
+float measuredRPM = 0;
+float inputRPM = 0;
 uint32_t rpm_cnt = 0;
 
 uint16_t input_pwm_min = 1000;
-uint16_t input_pwm_max = 2000;
+uint16_t input_pwm_max = 1900;
 
 uint32_t inputDutyCycle = 0;
 float inputFrequency = 0;
@@ -131,7 +146,35 @@ static void MX_ADC2_Init(void);
 static void MX_TIM15_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_TIM7_Init(void);
+static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
+void Controller(){
+	float kp = 0.005f, ki = 0.0025f, kd = 0.00f;
+	float error = (float)(inputRPM - measuredRPM);
+
+	static float sumIntegral;
+	sumIntegral += error * 0.00001;
+	sumIntegral = constrain(sumIntegral, -5000, 5000);
+
+	static float preverror;
+	float derivative = (error - preverror) * 0.00001;
+	preverror = error;
+
+	float output = kp * error + ki * sumIntegral + kd * derivative;
+	int16_t pwmError;
+	if(output < 0){
+		pwmError = (int16_t)map(output, -5000, 0,-PWM_MAX, PWM_MIN);
+	} else if(output >= 0){
+		pwmError = (int16_t)map(output, 0, 5000, PWM_MIN, PWM_MAX);
+	}
+	newPWM += pwmError;
+	setPWM = constrain(newPWM, PWM_MIN, PWM_MAX);
+
+	TIM1->CCR1 = setPWM;
+	TIM1->CCR5 = setPWM + compWindowOffset;
+
+}
 
 void getUSARTData(){
 	 if(USART1DataFlag){
@@ -140,7 +183,7 @@ void getUSARTData(){
 			 if(memcmp(data + 1, "PWM=", 4) == 0 || memcmp(data + 1, "pwm=", 4) == 0){
 				uint8_t value[4];
 				memcpy(value, data + 5, 4);
-				uint16_t x = atoi(value);
+				uint16_t x = atoi((char*)value);
 				if(x){
 					x = constrain(x, 1000, 2000);
 					newPWM = map(x, 1000, 2000, PWM_MIN, PWM_MAX);
@@ -153,18 +196,15 @@ void getUSARTData(){
 					HAL_UART_Transmit(&huart1, buffer, strSize, 50);
 				}
 			}
-			else if(memcmp(data + 1, "OCO=", 4) == 0 || memcmp(data + 1, "oco=", 4) == 0){
-				uint8_t value[3];
-				memcpy(value, data + 5, 3);
-				uint16_t x = atoi(value);
-				if(x) oc5Value  = constrain(x, 0, 255);
+			else if(memcmp(data + 1, "OC5=", 4) == 0 || memcmp(data + 1, "oc5=", 4) == 0){
+				//uint8_t value[3];
+				//memcpy(value, data + 5, 3);
+				oc5Value = (uint16_t)strtoul((char*)data + 5, '\0',10);
 				strSize = sprintf((char*)buffer, "oc5: %d\r\n", oc5Value);
 				HAL_UART_Transmit(&huart1, buffer, strSize, 50);
 			}
 			else if(memcmp(data + 1, "STA", 3) == 0 || memcmp(data + 1, "sta", 3) == 0){
 				motorGotStarted = 1;
-				HAL_TIM_IC_Stop_IT(&htim15, TIM_CHANNEL_1);
-				HAL_TIM_IC_Stop_IT(&htim15, TIM_CHANNEL_2);
 				strSize = sprintf((char*)buffer, "Start Motor\r\n");
 				HAL_UART_Transmit(&huart1, buffer, strSize, 50);
 			}
@@ -175,6 +215,15 @@ void getUSARTData(){
 				motorGotStarted = 0;
 				strSize = sprintf((char*)buffer, "Stop Motor\r\n");
 				HAL_UART_Transmit(&huart1, buffer, strSize, 50);
+			}
+			else if(memcmp(data + 1, "ADO", 3) == 0 || memcmp(data +1, "ado", 3) == 0){
+				adcOffset = (float)strtof((char*)data + 5,'\0');
+				strSize = sprintf((char*)buffer, "ADC Offset: %f\r\n", adcOffset);
+				HAL_UART_Transmit(&huart1, buffer, strSize, 20);
+			}
+			else if(memcmp(data + 1, "STS", 3) == 0 || memcmp(data + 1, "sts", 3) == 0){
+				strSize = sprintf((char*)buffer, "adcOffset: %f\r\noc5Value: %d\r\n", adcOffset, oc5Value);
+				HAL_UART_Transmit_IT(&huart1, buffer, strSize);
 			}
 		}
 	 }
@@ -220,9 +269,9 @@ void commutationPattern(uint8_t step){
 	if (step == NEXT && waitForCommutation == 1) {
 		if (commutationStepCounter < STEP_5)
 			commutationStepCounter++;
-		else
+		else{
 			commutationStepCounter = STEP_0;
-
+		}
 		switch (commutationStepCounter) {
 		case STEP_0:
 			commutateNow_0();
@@ -284,12 +333,6 @@ void commutationPattern(uint8_t step){
 			break;
 		}
 	}
-	if(commutationStepCounter == STEP_0){
-		__HAL_TIM_SET_COUNTER(&htim2, 0);
-	} else if(commutationStepCounter == STEP_5){
-		tim2cnt = __HAL_TIM_GET_COUNTER(&htim2);
-		readRotation = true;
-	}
 }
 
 /*void startMotor(void){
@@ -312,14 +355,50 @@ void commutationPattern(uint8_t step){
 	motorGotStarted = 2;
 }*/
 
+/*void startMotor(){
+	TIM1->CCR1 = 350;
+	TIM1->CCR5 = 350 + compWindowOffset;
+	waitForCommutation = 0;
+
+	commutateNow_0();
+	HAL_Delay(10);
+	commutateNow_2();
+	HAL_Delay(10);
+
+	commutateNow_4();
+	COMPDELAY;
+	HAL_COMP_Start(&hcomp1);
+	while(HAL_COMP_GetOutputLevel(&hcomp1) != COMP_OUTPUTLEVEL_LOW);
+	HAL_COMP_Stop(&hcomp1);
+
+	commutateNow_5();
+	COMPDELAY;
+	HAL_COMP_Start(&hcomp3);
+	while(HAL_COMP_GetOutputLevel(&hcomp3) != COMP_OUTPUTLEVEL_HIGH);
+	HAL_COMP_Stop(&hcomp3);
+
+	__HAL_ADC_DISABLE_IT(&hadc1, ADC_IT_EOC);
+	__HAL_ADC_DISABLE_IT(&hadc2, ADC_IT_EOC);
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)csADC, 12);
+	mode_motor = MODE_MOTOR_RUN;
+
+	commutationStepCounter = STEP_5;
+	waitForCommutation = 1;
+	HAL_TIM_Base_Start(&htim7);
+	commutationPattern(NEXT);
+	//HAL_ADC_Start_IT(&hadc1);
+
+	motorGotStarted = 2;
+}*/
+
 void startMotor(){
-	mode_motor = MODE_MOTOR_START;
-	newPWM = setPWM = 300;
+	adcIntegral = 0;
+	setPWM =  newPWM = 350;
 
 	TIM1->CCR1 = setPWM;
 	TIM1->CCR5 = setPWM + compWindowOffset;
 
-/*	uint8_t step = 0;
+	uint8_t step = 0;
 	uint16_t i = 2020;
 
 	while(i > 1300){
@@ -329,13 +408,21 @@ void startMotor(){
 		step %= 6;
 		i -= 10;
 		//DWT_Delay(10);
-	}*/
+	}
 
-	commutationStepCounter = STEP_0;
+	//HAL_ADC_Start_IT(&hadc1);
+	__HAL_ADC_DISABLE_IT(&hadc1, ADC_IT_EOC);
+	__HAL_ADC_DISABLE_IT(&hadc1, ADC_IT_EOS);
+	__HAL_ADC_DISABLE_IT(&hadc2, ADC_IT_EOC);
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t*)csADC, 12);
+
+	__HAL_TIM_SET_COUNTER(&htim2, 0);
+	commutationStepCounter = STEP_5;
 	waitForCommutation = 1;
+	HAL_TIM_Base_Start(&htim7);
 	commutationPattern(NEXT);
-	waitForCommutation = 1;
-	motorGotStarted = 2;
+
+	mode_motor = MODE_MOTOR_RUN;
 }
 
 
@@ -387,25 +474,32 @@ int main(void)
   MX_TIM15_Init();
   MX_TIM2_Init();
   MX_TIM6_Init();
+  MX_TIM7_Init();
+  MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
-  HAL_Delay(500);
+  HAL_Delay(100);
   DWT_Init();
-
-  HAL_TIM_Base_Start(&htim2);
-  HAL_TIM_Base_Start_IT(&htim6);
+  mode_motor = MODE_MOTOR_STOP;
 
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
 
-  //HAL_ADC_Start(&hadc2);
+  sConfigOC5B.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC5B.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC5B.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC5B.OCPolarity = TIM_OCPOLARITY_HIGH; //HIGH for PWM low detection
+
+  sConfigOC5A.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC5A.OCFastMode = TIM_OCFAST_DISABLE; //DISABLE
+  sConfigOC5A.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC5A.OCPolarity = TIM_OCPOLARITY_LOW; //LOW for PWM high detection
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_5);
-  HAL_TIM_OC_Start(&htim1, TIM_CHANNEL_2);
-
+  HAL_TIM_Base_Start(&htim2);
   //HAL_TIM_OC_Start_IT(&htim3, TIM_CHANNEL_1);
   HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
   HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 0);
@@ -417,6 +511,9 @@ int main(void)
 	  Error_Handler();
   }
 
+  HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_Base_Start_IT(&htim16);
+
   __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 
   HAL_TIM_IC_Start_IT(&htim15, TIM_CHANNEL_1);
@@ -425,31 +522,59 @@ int main(void)
   strSize = sprintf((char*)buffer, "Test\r\n");
   HAL_UART_Transmit(&huart1, buffer, strSize, 10);
 
-  motorGotStarted = 0;
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if(motorGotStarted == 1){
+	  switch(mode_motor){
+	  case MODE_MOTOR_STOP:
+		  break;
+	  case MODE_MOTOR_CALIBRATION:
+		  while(mode_motor == MODE_MOTOR_CALIBRATION){
+			  static int calibration_counter;
+			  if(inputDutyCycle < input_pwm_min) input_pwm_min = inputDutyCycle;
+			  if(inputDutyCycle > input_pwm_max) input_pwm_max = inputDutyCycle;
+			  if(inputDutyCycle < 1050){
+				  if(calibration_counter > 1000){
+					  strSize = sprintf((char*)buffer, "motor ready\r\n");
+					  HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+					  mode_motor = MODE_MOTOR_READY;
+				  }
+				  calibration_counter++;
+				  HAL_Delay(1);
+			  }
+		  }
+		  break;
+	  case MODE_MOTOR_READY:
+		  TIM1->CCR1 = 0;
+		  TIM1->CCR5 = 0;
+		  tim2cnt = 0;
+		  break;
+	  case MODE_MOTOR_START:
 		  startMotor();
-		  HAL_TIM_IC_Start_IT(&htim15, TIM_CHANNEL_1);
-		  HAL_TIM_IC_Start_IT(&htim15, TIM_CHANNEL_2);
-	  }
-	  //uint32_t x = adcIntegral;
-	  getUSARTData();
-	  //strSize=sprintf((char*)buffer, "%lu\r\n", x);
-	  //HAL_UART_Transmit(&huart1, buffer, strSize, 10);
-	  /*if(readRotation){
-		  static float xyz;
-		  xyz = (float)tim2cnt;
-		  rpm = getRPM(xyz);
-		  strSize = sprintf((char*)buffer, "rpm: %f\r\n", rpm);
-		  HAL_UART_Transmit(&huart1, buffer, strSize, 10);
-		  readRotation = false;
-	  }*/
+		  break;
+	  case MODE_MOTOR_RUN:
+			newPWM = map(inputDutyCycle, input_pwm_min, input_pwm_max, PWM_MIN, PWM_MAX);
+			setPWM = newPWM;
 
+		  	if(inputDutyCycle < 1050){
+				measuredRPM = 0;
+				inputRPM = 0;
+				mode_motor = MODE_MOTOR_READY;
+				strSize = sprintf((char*)buffer, "motor ready\r\n");
+				HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+				HAL_ADC_Stop_DMA(&hadc1);
+		  	} else {
+				TIM1->CCR1 = setPWM;
+				TIM1->CCR5 = setPWM + compWindowOffset;
+		  	}
+	  	  break;
+	  }
+
+	  getUSARTData();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -497,7 +622,7 @@ void SystemClock_Config(void)
   PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_TIM1
                               |RCC_PERIPHCLK_ADC12;
   PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
-  PeriphClkInit.Adc12ClockSelection = RCC_ADC12PLLCLK_DIV32;
+  PeriphClkInit.Adc12ClockSelection = RCC_ADC12PLLCLK_DIV6;
   PeriphClkInit.Tim1ClockSelection = RCC_TIM1CLK_HCLK;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -529,14 +654,14 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
-  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_FALLING;
-  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T4_CC4;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
   hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -555,7 +680,7 @@ static void MX_ADC1_Init(void)
   sConfig.Channel = ADC_CHANNEL_1;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_19CYCLES_5;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
@@ -597,7 +722,7 @@ static void MX_ADC2_Init(void)
   hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc2.Init.NbrOfConversion = 1;
-  hadc2.Init.DMAContinuousRequests = DISABLE;
+  hadc2.Init.DMAContinuousRequests = ENABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
   hadc2.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
@@ -610,7 +735,7 @@ static void MX_ADC2_Init(void)
   sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = ADC_REGULAR_RANK_1;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
-  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
   if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK)
@@ -788,7 +913,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 2 - 1;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED3;
-  htim1.Init.Period = 1800 - 1;
+  htim1.Init.Period = 2000;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -800,8 +925,8 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_RESET;
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC1;
+  sMasterConfig.MasterOutputTrigger2 = TIM_TRGO2_OC5REF_RISING_OC6REF_RISING;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
   {
@@ -826,7 +951,6 @@ static void MX_TIM1_Init(void)
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
   sConfigOC.Pulse = 120;
-  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_5) != HAL_OK)
   {
     Error_Handler();
@@ -872,7 +996,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
+  htim2.Init.Prescaler = 4 - 1;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 4294967295;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -968,9 +1092,9 @@ static void MX_TIM6_Init(void)
 
   /* USER CODE END TIM6_Init 1 */
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 7200 - 1;
+  htim6.Init.Prescaler = 72 - 1;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 5000 - 1;
+  htim6.Init.Period = 10 ;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -985,6 +1109,44 @@ static void MX_TIM6_Init(void)
   /* USER CODE BEGIN TIM6_Init 2 */
 
   /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 6 - 1;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 65535;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
 
 }
 
@@ -1054,6 +1216,38 @@ static void MX_TIM15_Init(void)
 }
 
 /**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 72 - 1;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 1000;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+
+}
+
+/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -1069,7 +1263,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 1000000;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -1096,11 +1290,18 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
+  __HAL_RCC_DMA2_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 3, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
   /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+  /* DMA2_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel1_IRQn);
 
 }
 
@@ -1188,15 +1389,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
     USART1DataFlag = true;
 
 }
-void HAL_COMP_TriggerCallback(COMP_HandleTypeDef *hcomp){
-
-}
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
-	if(htim->Instance == TIM6){
-		HAL_GPIO_TogglePin(GPIOB, LED1_Pin | LED2_Pin);
-	}
-}
 
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim){
 	static uint32_t Count_RisingEdge;
@@ -1225,11 +1417,13 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim){
 
 		if(Count_RisingEdge < Count_FallingEdge){
 			inputDutyCycle = Count_FallingEdge - Count_RisingEdge;
-			input_pwm_min = inputDutyCycle < input_pwm_min ? inputDutyCycle : input_pwm_min;
-			input_pwm_max = inputDutyCycle > input_pwm_max ? inputDutyCycle : input_pwm_max;
+			//input_pwm_min = inputDutyCycle < input_pwm_min ? inputDutyCycle : input_pwm_min;
+			//input_pwm_max = inputDutyCycle > input_pwm_max ? inputDutyCycle : input_pwm_max;
 
-			newPWM = map(inputDutyCycle, input_pwm_min, input_pwm_max, PWM_MIN, PWM_MAX);
-			setPWM = newPWM;
+			//strSize = sprintf((char*)buffer, "DutyCycle: %lu, Frequency: %f\r\n", inputDutyCycle, inputFrequency);
+			//HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+
+			//inputRPM = map(inputDutyCycle, 1000, 2000, 0, 5000);
 
 			Count_RisingEdge = 0;
 			Count_FallingEdge = 0;
@@ -1239,28 +1433,204 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim){
 	if(inputFrequency >= FREQ_INPUT_PWM_MIN && inputFrequency <= FREQ_INPUT_PWM_MAX){
 		//strSize = sprintf((char*)buffer, "Frequency %f\t PWM: %d\r\n", inputFrequency, setPWM);
 		//HAL_UART_Transmit(&huart1, buffer, strSize, 10);
-		if(setPWM >= 300 && motorGotStarted == 0){
-			//motorGotStarted = 1;
-			HAL_TIM_IC_Stop_IT(&htim15, TIM_CHANNEL_1);
-			HAL_TIM_IC_Stop_IT(&htim15, TIM_CHANNEL_2);
-			motorGotStarted = 1;
-			strSize = sprintf((char*)buffer, "Motor Started\r\n");
+		if(inputDutyCycle >= 1050 && mode_motor == MODE_MOTOR_STOP){
+			mode_motor = MODE_MOTOR_CALIBRATION;
+			strSize = sprintf((char*)buffer, "motor calibration\r\n");
 			HAL_UART_Transmit(&huart1, buffer, strSize, 10);
-		}
-
-		if(setPWM <= 50 && motorGotStarted != 0) {
-			TIM1->CCR1 = 0;
-			TIM1->CCR5 = 0;
-		}
-
-		if(motorGotStarted == 2){
-			TIM1->CCR1 = setPWM;
-			TIM1->CCR5 = setPWM + compWindowOffset;
+		} else if(inputDutyCycle < 1050 && mode_motor == MODE_MOTOR_STOP){
+			mode_motor = MODE_MOTOR_READY;
+			strSize = sprintf((char*)buffer, "motor ready\r\n");
+			HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+		} else if(inputDutyCycle >= 1050 && mode_motor == MODE_MOTOR_READY){
+			mode_motor = MODE_MOTOR_START;
+			strSize = sprintf((char*)buffer, "motor start\r\n");
+			HAL_UART_Transmit(&huart1, buffer, strSize, 10);
 		}
 	}
 }
 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+	if(htim->Instance == TIM6){
+		static int count;
+		count++;
+		//measuredRPM = getRPM(tim2cnt);
+		//strSize = sprintf((char*)buffer, "%f\r\n", measuredRPM);
+		//HAL_UART_Transmit_IT(&huart1, buffer, strSize);
+		if(count % 100 == 0 && mode_motor == MODE_MOTOR_RUN){
+			strSize = sprintf((char*)buffer, "%lu\r\n", tim2cnt);
+			HAL_UART_Transmit_IT(&huart1, buffer, strSize);
+		}
 
+	}
+	else if(htim->Instance == TIM16){
+		//Controller();
+		static bool flash;
+		static uint64_t led_counter;
+		led_counter++;
+		switch(mode_motor){
+		case MODE_MOTOR_STOP:
+			if(led_counter % 1000 == 0) HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+			break;
+		case MODE_MOTOR_CALIBRATION:
+			if(led_counter % 100 == 0) HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+			break;
+		case MODE_MOTOR_READY:
+			if(led_counter % 2000 == 0) flash = true;
+			if(flash){
+				static uint8_t flash_count;
+				if(led_counter % 100 == 0){
+					flash_count++;
+					HAL_GPIO_TogglePin(LED2_GPIO_Port, LED2_Pin);
+					if(flash_count >= 10) {
+						flash_count = 0;
+						flash = false;
+					}
+				}
+			} else if(HAL_GPIO_ReadPin(LED2_GPIO_Port, LED2_Pin) != GPIO_PIN_SET && !flash)
+				HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+			break;
+		default:
+			if(HAL_GPIO_ReadPin(LED2_GPIO_Port, LED2_Pin) != GPIO_PIN_SET) 	HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+			break;
+
+		}
+	}
+}
+
+void HAL_COMP_TriggerCallback(COMP_HandleTypeDef *hcomp)
+{
+	static uint8_t count;
+	TIM1->CCR5 = setPWM + compWindowOffset;
+
+	if(hcomp->Instance == COMP1 && waitForCommutation == 0){
+		count++;
+		if(count >= 0){
+			count = 0;
+
+			tim2cnt = __HAL_TIM_GET_COUNTER(&htim2);
+			__HAL_TIM_SET_COUNTER(&htim2, 0);
+
+
+			HAL_COMP_Stop_IT(&hcomp1);
+			sConfig.Channel = ADC_CHANNEL_2;
+			HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+			HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adcBuffer, 10);
+			//HAL_ADC_Start_IT(&hadc2);
+
+			waitForCommutation = 1;
+		}
+
+
+	}
+
+	else if(hcomp->Instance == COMP2 && waitForCommutation == 0){
+		count++;
+		if(count >= 0){
+			count = 0;
+
+			tim2cnt = __HAL_TIM_GET_COUNTER(&htim2);
+			__HAL_TIM_SET_COUNTER(&htim2, 0);
+
+			HAL_COMP_Stop_IT(&hcomp2);
+			sConfig.Channel = ADC_CHANNEL_3;
+			HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+			HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adcBuffer, 10);
+			//HAL_ADC_Start_IT(&hadc2);
+
+			waitForCommutation = 1;
+		}
+
+	}
+
+	else if(hcomp->Instance == COMP3 && waitForCommutation == 0){
+		count++;
+		if(count >= 0){
+			count = 0;
+
+			tim2cnt = __HAL_TIM_GET_COUNTER(&htim2);
+			__HAL_TIM_SET_COUNTER(&htim2, 0);
+
+			HAL_COMP_Stop_IT(&hcomp3);
+			sConfig.Channel = ADC_CHANNEL_4;
+			HAL_ADC_ConfigChannel(&hadc2, &sConfig);
+			HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adcBuffer, 10);
+			//HAL_ADC_Start_IT(&hadc2);
+
+			waitForCommutation = 1;
+		}
+
+	}
+
+	if(setPWM > 300 && !pwmState){
+		HAL_GPIO_WritePin(GPIOB, OUT_A_Pin | OUT_B_Pin | OUT_C_Pin, GPIO_PIN_RESET);
+
+		HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_5);
+		HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 1800 + oc5Value);
+		compWindowOffset = -80;
+
+		HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC5A, TIM_CHANNEL_5);
+		TIM1->CCR5 = setPWM + compWindowOffset;
+		pwmState = 1;
+		HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_5);
+	}
+
+	if(setPWM < 250 && pwmState){
+		HAL_GPIO_WritePin(GPIOB, OUT_A_Pin | OUT_B_Pin | OUT_C_Pin, GPIO_PIN_SET);
+
+		HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_5);
+		HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 0);
+		compWindowOffset = 250;
+
+		HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC5B, TIM_CHANNEL_5);
+		TIM1->CCR5 = setPWM + compWindowOffset;
+		pwmState = 0;
+		HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_5);
+	}
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
+	static float csADCAverage;
+	static uint32_t csADCTotal;
+	static float adcAverage;
+	static float adcTotal;
+	/*if(hadc->Instance == ADC2){
+		adcIntegral += (float)HAL_ADC_GetValue(&hadc2);
+
+		if(adcIntegral >= adcOffset){
+			HAL_ADC_Stop_IT(&hadc2);
+			adcIntegral = 0;
+			commutationPattern(NEXT);
+		} else{
+			HAL_ADC_Start_IT(&hadc2);
+		}
+	}*/
+	if(hadc->Instance == ADC2){
+		for(int i = 0; i < 10; i++){
+			adcTotal += (float)adcBuffer[i];
+		}
+		adcAverage = adcTotal / 10;
+		adcIntegral += adcAverage;
+
+		adcTotal = 0;
+
+		if(adcIntegral > adcOffset){
+			HAL_ADC_Stop_DMA(&hadc2);
+			adcIntegral = 0;
+
+			commutationPattern(NEXT);
+		}
+	}
+
+	if(hadc->Instance == ADC1){
+		for(int i = 0; i < 12; i++){
+			csADCTotal += csADC[i];
+		}
+		csADCAverage = (float)csADCTotal / 12;
+		csADCTotal = 0;
+		//csSize = sprintf((char*)csString, "%f\r\n", csADCAverage);
+		//HAL_UART_Transmit_IT(&huart1, csString, csSize);
+	}
+}
 /* USER CODE END 4 */
 
 /**

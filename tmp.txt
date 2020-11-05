@@ -179,3 +179,27 @@ void startMotor(){
 		HAL_ADC_Stop(&hadc2);
 		commutationPattern(NEXT);
 	}*/
+	
+	
+	/*else if(inputDutyCycle >= 1150 && mode_motor == MODE_MOTOR_START){
+			mode_mootr = MODE_MOTOR_RUN;
+		}*/
+		/*if(inputDutyCycle >= 1100 && mode_motor == MODE_MOTOR_STOP){
+			mode_motor = MODE_MOTOR_START;
+			strSize = sprintf((char*)buffer, "Motor Started\r\n");
+			HAL_UART_Transmit(&huart1, buffer, strSize, 10);
+		}
+
+		if(inputDutyCycle < 1100 && mode_motor != MODE_MOTOR_STOP) {
+			measuredRPM = 0;
+			inputRPM = 0;
+			TIM1->CCR1 = 0;
+			TIM1->CCR5 = 0;
+			mode_motor = MODE_MOTOR_STOP;
+			HAL_ADC_Stop_DMA(&hadc1);
+		}
+
+		if(mode_motor == MODE_MOTOR_RUN){
+			TIM1->CCR1 = setPWM;
+			TIM1->CCR5 = setPWM + compWindowOffset;
+		}*/

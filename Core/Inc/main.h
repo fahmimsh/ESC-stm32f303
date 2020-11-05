@@ -69,6 +69,8 @@ void Error_Handler(void);
 #define ADC_CS_GPIO_Port GPIOA
 #define COMP_PHASEA_Pin GPIO_PIN_1
 #define COMP_PHASEA_GPIO_Port GPIOA
+#define PWMIN_Pin GPIO_PIN_2
+#define PWMIN_GPIO_Port GPIOA
 #define COMP_PHASEB_Pin GPIO_PIN_3
 #define COMP_PHASEB_GPIO_Port GPIOA
 #define ADC_PHASEA_Pin GPIO_PIN_5
@@ -106,11 +108,13 @@ void Error_Handler(void);
 /* USER CODE BEGIN Private defines */
 #define map(x,in_min,in_max,out_min,out_max) ( (x-in_min) * (out_max-out_min) / (in_max-in_min) + out_min )
 #define constrain(nilaix,bawah,atas) ( (nilaix)<(bawah) ? (bawah) : ( (nilaix)>(atas) ? (atas) : (nilaix) ) )
-#define getRPM(cnt) (360 / (cnt / 72000000)) *  0.1666667
-#define PWM_MAX 1500
+//#define getRPM(cnt) (float)((360 / ((float)cnt / 18000000)) /  6) / 12
+//#define geRPM(T) 60 / (T * 6 * 6/12000000)
+#define getRPM(T) 3333333.33333/(float)T
+#define PWM_MAX 1600
 #define PWM_MIN 0
-#define FREQ_INPUT_PWM_MAX 50.1
-#define FREQ_INPUT_PWM_MIN 49.99
+#define FREQ_INPUT_PWM_MAX 51.0
+#define FREQ_INPUT_PWM_MIN 48.0
 #define NEXT 9
 #define STEP_0 0
 #define STEP_1 1
@@ -118,8 +122,7 @@ void Error_Handler(void);
 #define STEP_3 3
 #define STEP_4 4
 #define STEP_5 5
-#define COMPDELAY for(uint32_t i = 0; i < 250; i++)
-
+#define COMPDELAY for(uint32_t i = 0; i < 250; i++) asm("nop")
 #define DMA_BUF_SIZE 50
 #define DMA_TIMEOUT_MS 10      /* DMA Timeout duration in msec */
 /* USER CODE END Private defines */

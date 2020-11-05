@@ -46,8 +46,8 @@ F303-ECOPENS.bin \
 all: F303-ECOPENS.elf secondary-outputs
 
 # Tool invocations
-F303-ECOPENS.elf: $(OBJS) $(USER_OBJS) D:\Dirgantara\Frimware\F303-ECOPENS\STM32F303CCTX_FLASH.ld
-	arm-none-eabi-gcc -o "F303-ECOPENS.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"D:\Dirgantara\Frimware\F303-ECOPENS\STM32F303CCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="F303-ECOPENS.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
+F303-ECOPENS.elf: $(OBJS) $(USER_OBJS) C:\Users\LENOVO\STM32CubeIDE\workspace_1.4.2\F303-ECOPENS\STM32F303CCTX_FLASH.ld
+	arm-none-eabi-gcc -o "F303-ECOPENS.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m4 -T"C:\Users\LENOVO\STM32CubeIDE\workspace_1.4.2\F303-ECOPENS\STM32F303CCTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="F303-ECOPENS.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb -u _printf_float -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
