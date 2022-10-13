@@ -5,3 +5,6 @@ console.log("Hello tHIS REPO already to open")
 function main(){
   return null;
 }
+main()
+
+//console.log(main)
